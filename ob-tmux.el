@@ -73,7 +73,8 @@ Change in case you want to use a different tmux than the one in your $PATH."
 (defvar org-babel-default-header-args:tmux
   '((:results . "silent")
     (:session . "default")
-    (:socket . nil))
+    (:socket . nil)
+    (:ssh . nil))
   "Default arguments to use when running tmux source blocks.")
 
 (add-to-list 'org-src-lang-modes '("tmux" . sh))
@@ -98,7 +99,10 @@ Argument PARAMS the org parameters of the code block."
 	   (terminal (or org-header-terminal org-babel-tmux-terminal))
 	   (socket (cdr (assq :socket params)))
 	   (socket (when socket (expand-file-name socket)))
-	   (ob-session (ob-tmux--from-org-session org-session socket))
+	   (ssh (cdr (assq :ssh params)))
+	   (_ (when (and socket ssh)
+		(user-error "ob-tmux: :ssh and :socket are mutually exclusive")))
+	   (ob-session (ob-tmux--from-org-session org-session socket ssh))
            (session-alive (ob-tmux--session-alive-p ob-session))
 	   (window-alive (ob-tmux--window-alive-p ob-session)))
       ;; Create tmux session and window if they do not yet exist
@@ -126,7 +130,8 @@ Argument PARAMS the org parameters of the code block."
 			(:copier ob-tmux--copy))
   session
   window
-  socket)
+  socket
+  ssh)
 
 (defun ob-tmux--tmux-session (org-session)
   "Extract tmux session from ORG-SESSION string."
@@ -138,14 +143,16 @@ Argument PARAMS the org parameters of the code block."
   (let* ((window (cadr (split-string org-session ":"))))
     (if (string-equal "" window) nil window)))
 
-(defun ob-tmux--from-org-session (org-session &optional socket)
+(defun ob-tmux--from-org-session (org-session &optional socket ssh)
   "Create a new ob-tmux-session object from ORG-SESSION specification.
-Optional argument SOCKET: the location of the tmux socket (only use if non-standard)."
+Optional argument SOCKET: the location of the tmux socket (only use if non-standard).
+Optional argument SSH: SSH host for remote tmux execution."
 
   (ob-tmux--create
    :session (ob-tmux--tmux-session org-session)
    :window (ob-tmux--tmux-window org-session)
-   :socket socket))
+   :socket socket
+   :ssh ssh))
 
 (defun ob-tmux--window-default (ob-session)
   "Extracts the tmux window from the ob-tmux- object.
@@ -177,13 +184,18 @@ Argument OB-SESSION: the current ob-tmux session."
 
 Argument OB-SESSION: the current ob-tmux session.
 Optional command-line arguments can be passed in ARGS."
-  (if (ob-tmux--socket ob-session)
+  (let ((ssh (ob-tmux--ssh ob-session))
+	(socket (ob-tmux--socket ob-session)))
+    (cond
+     (ssh
       (apply 'start-process "ob-tmux" "*Messages*"
-	     org-babel-tmux-location
-	     "-S" (ob-tmux--socket ob-session)
-	     args)
-    (apply 'start-process
-	   "ob-tmux" "*Messages*" org-babel-tmux-location args)))
+	     "ssh" ssh org-babel-tmux-location args))
+     (socket
+      (apply 'start-process "ob-tmux" "*Messages*"
+	     org-babel-tmux-location "-S" socket args))
+     (t
+      (apply 'start-process "ob-tmux" "*Messages*"
+	     org-babel-tmux-location args)))))
 
 (defun ob-tmux--execute-string (ob-session &rest args)
   "Execute a tmux command with arguments as given.
@@ -192,11 +204,15 @@ Returns stdout as a string.
 Argument OB-SESSION: the current ob-tmux session.  Optional
 command-line arguments can be passed in ARGS and are
 automatically space separated."
-  (let* ((socket (ob-tmux--socket ob-session))
-	 (args (if socket (cons "-S" (cons socket args)) args)))
-  (shell-command-to-string
-   (concat org-babel-tmux-location " "
-	   (s-join " " args)))))
+  (let* ((ssh (ob-tmux--ssh ob-session))
+	 (socket (ob-tmux--socket ob-session))
+	 (args (if socket (cons "-S" (cons socket args)) args))
+	 (tmux-cmd (concat org-babel-tmux-location " "
+			   (s-join " " args))))
+    (shell-command-to-string
+     (if ssh
+	 (concat "ssh " (shell-quote-argument ssh) " " tmux-cmd)
+       tmux-cmd))))
 
 (defun ob-tmux--start-terminal-window (ob-session terminal)
   "Start a TERMINAL window with tmux attached to session.
@@ -208,7 +224,8 @@ automatically space separated."
 	(tmux-cmd `(,org-babel-tmux-location
 		    "attach-session"
 		    "-t" ,(ob-tmux--target ob-session))))
-    (unless (ob-tmux--socket ob-session)
+    (unless (or (ob-tmux--socket ob-session)
+		(ob-tmux--ssh ob-session))
       (apply 'start-process (append start-process-mandatory-args
 				    org-babel-tmux-terminal-opts
 				    tmux-cmd)))))
@@ -225,7 +242,7 @@ Argument OB-SESSION: the current ob-tmux session."
     (ob-tmux--execute ob-session
      "new-session"
      "-d" ;; just create the session, don't attach.
-     "-c" (expand-file-name "~") ;; start in home directory
+     "-c" (if (ob-tmux--ssh ob-session) "~" (expand-file-name "~"))
      "-s" (ob-tmux--session ob-session)
      "-n" (ob-tmux--window-default ob-session))))
 
@@ -236,7 +253,7 @@ Argument OB-SESSION: the current ob-tmux session."
   (unless (ob-tmux--window-alive-p ob-session)
     (ob-tmux--execute ob-session
      "new-window"
-     "-c" (expand-file-name "~") ;; start in home directory
+     "-c" (if (ob-tmux--ssh ob-session) "~" (expand-file-name "~"))
      "-n" (ob-tmux--window-default ob-session)
      "-t" (ob-tmux--session ob-session))))
 
