@@ -375,7 +375,7 @@ BODY: the code to execute, embedded as a heredoc."
      "  sleep 1\n"
      "  PANE=$(tmux capture-pane -p -t \"$TARGET\")\n"
      "  if echo \"$PANE\" | grep -qx \"OB_TMUX_END_$UUID\"; then\n"
-     "    echo \"$PANE\" | sed -n \"/^OB_TMUX_START_${UUID}$/,/^OB_TMUX_END_${UUID}$/p\" | sed '1d;$d' | grep -v '^[^$]*\\$ '\n"
+     "    echo \"$PANE\" | sed -n \"/^OB_TMUX_START_${UUID}$/,/^OB_TMUX_END_${UUID}$/p\" | sed '1d;$d' | grep -v '^[^$]*\\$ ' | grep -v 'OB_TMUX_'\n"
      "    exit 0\n  fi\n"
      "  ELAPSED=$((ELAPSED + 1))\ndone\n"
      "echo \"ob-tmux: timeout after ${TIMEOUT}s\" >&2\nexit 1\n")))
