@@ -71,10 +71,10 @@ Change in case you want to use a different tmux than the one in your $PATH."
   :group 'org-babel
   :type 'list)
 
-(defcustom org-babel-tmux-poll-interval 1.0
-  "Polling interval in seconds for async output capture."
+(defcustom org-babel-tmux-ssh-timeout 60
+  "Timeout in seconds for server-side output polling over SSH."
   :group 'org-babel
-  :type 'number)
+  :type 'integer)
 
 (defvar org-babel-default-header-args:tmux
   '((:results . "silent")
@@ -109,40 +109,21 @@ Argument PARAMS the org parameters of the code block."
 	   (_ (when (and socket ssh)
 		(user-error "ob-tmux: :ssh and :socket are mutually exclusive")))
 	   (ob-session (ob-tmux--from-org-session org-session socket ssh))
-           (session-alive (ob-tmux--session-alive-p ob-session))
-	   (window-alive (ob-tmux--window-alive-p ob-session)))
-      ;; Create tmux session and window if they do not yet exist
-      (unless session-alive (ob-tmux--create-session ob-session))
-      (unless window-alive (ob-tmux--create-window ob-session))
-      ;; Start terminal window if the session does not yet exist
-      (unless session-alive
-	(ob-tmux--start-terminal-window ob-session terminal))
-      ;; Wait until tmux window is available
-      (while (not (ob-tmux--window-alive-p ob-session)))
-      ;; Disable window renaming from within tmux
-      (ob-tmux--disable-renaming ob-session)
-      (let* ((expanded-body (org-babel-expand-body:generic body params vars))
-	     (result-params (cdr (assq :result-params params)))
-	     (output-p (and (member "output" result-params)
-			    (ob-tmux--ssh ob-session))))
-	(if output-p
-	    ;; Async output capture: wrap with markers, poll for results
-	    (let ((uuid (org-id-uuid))
-		  (src-block-pos (org-babel-where-is-src-block-head)))
-	      (ob-tmux--send-body-with-markers ob-session expanded-body uuid)
-	      ;; Insert UUID placeholder as #+RESULTS
-	      (save-excursion
-		(goto-char src-block-pos)
-		(end-of-line)
-		(org-babel-insert-result uuid '("output" "replace")))
-	      (ob-tmux--start-output-poll
-	       ob-session uuid (current-buffer) src-block-pos)
-	      ;; Return nil; we handle results ourselves
-	      nil)
-	  ;; Default: send body silently
+	   (expanded-body (org-babel-expand-body:generic body params vars)))
+      (if ssh
+	  ;; === SSH PATH: fully non-blocking ===
+	  (let ((result-params (cdr (assq :result-params params))))
+	    (ob-tmux--ssh-dispatch ob-session expanded-body result-params))
+	;; === LOCAL / SOCKET PATH: unchanged ===
+	(let ((session-alive (ob-tmux--session-alive-p ob-session))
+	      (window-alive (ob-tmux--window-alive-p ob-session)))
+	  (unless session-alive (ob-tmux--create-session ob-session))
+	  (unless window-alive (ob-tmux--create-window ob-session))
+	  (unless session-alive
+	    (ob-tmux--start-terminal-window ob-session terminal))
+	  (while (not (ob-tmux--window-alive-p ob-session)))
+	  (ob-tmux--disable-renaming ob-session)
 	  (ob-tmux--send-body ob-session expanded-body)
-	  ;; Warn that setting the terminal from the org source block
-	  ;; header arguments is going to be deprecated.
 	  (when org-header-terminal
 	    (ob-tmux--deprecation-warning org-header-terminal))
 	  nil)))))
@@ -361,74 +342,132 @@ If no window is specified in OB-SESSION, returns 't."
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Async output capture
+;; SSH async execution
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defun ob-tmux--capture-pane (ob-session)
-  "Capture the contents of the tmux pane for OB-SESSION."
-  (ob-tmux--execute-string ob-session
-   "capture-pane" "-p" "-t" (concat "'" (ob-tmux--target ob-session) "'")))
+(defun ob-tmux--ssh-script-output (session window uuid timeout body)
+  "Generate a self-contained shell script for SSH async output capture.
+SESSION and WINDOW: tmux target names.
+UUID: unique marker identifier.
+TIMEOUT: max seconds to poll.
+BODY: the code to execute, embedded as a heredoc."
+  (let ((heredoc-marker (format "OB_TMUX_BODY_%s" uuid)))
+    (concat
+     (format "SESSION=%s\nWINDOW=%s\nUUID=%s\nTIMEOUT=%s\n"
+	     (shell-quote-argument session)
+	     (shell-quote-argument window)
+	     (shell-quote-argument uuid)
+	     (number-to-string timeout))
+     "TARGET=\"$SESSION:=$WINDOW\"\n"
+     "tmux has-session -t \"$SESSION\" 2>/dev/null || \\\n"
+     "  tmux new-session -d -c ~ -s \"$SESSION\" -n \"$WINDOW\"\n"
+     "if ! tmux list-windows -t \"$SESSION\" -F '#W' | grep -qx \"$WINDOW\"; then\n"
+     "  tmux new-window -c ~ -n \"$WINDOW\" -t \"$SESSION\"\nfi\n"
+     "tmux set-window-option -t \"$TARGET\" allow-rename off 2>/dev/null\n"
+     "tmux set-window-option -t \"$TARGET\" automatic-rename off 2>/dev/null\n"
+     "tmux send-keys -t \"$TARGET\" \"echo 'OB_TMUX_START_'\"$UUID\"''\" Enter\n"
+     (format "while IFS= read -r line || [ -n \"$line\" ]; do\n  tmux send-keys -l -t \"$TARGET\" -- \"$line\"\n  tmux send-keys -t \"$TARGET\" Enter\ndone <<'%s'\n" heredoc-marker)
+     body "\n"
+     heredoc-marker "\n"
+     "tmux send-keys -t \"$TARGET\" \"echo 'OB_TMUX_END_'\"$UUID\"''\" Enter\n"
+     "ELAPSED=0\n"
+     "while [ $ELAPSED -lt $TIMEOUT ]; do\n"
+     "  sleep 1\n"
+     "  PANE=$(tmux capture-pane -p -t \"$TARGET\")\n"
+     "  if echo \"$PANE\" | grep -qx \"OB_TMUX_END_$UUID\"; then\n"
+     "    echo \"$PANE\" | sed -n \"/^OB_TMUX_START_${UUID}$/,/^OB_TMUX_END_${UUID}$/p\" | sed '1d;$d' | grep -v '^[^$]*\\$ '\n"
+     "    exit 0\n  fi\n"
+     "  ELAPSED=$((ELAPSED + 1))\ndone\n"
+     "echo \"ob-tmux: timeout after ${TIMEOUT}s\" >&2\nexit 1\n")))
 
-(defun ob-tmux--send-body-with-markers (ob-session body uuid)
-  "Send BODY to OB-SESSION wrapped with start/end markers identified by UUID.
-All commands are concatenated into a single send-keys call to preserve ordering."
-  (let* ((start-cmd (concat "echo 'OB_TMUX_START_" uuid "'"))
-	 (end-cmd (concat "echo 'OB_TMUX_END_" uuid "'"))
-	 (full-body (concat start-cmd "\n" body "\n" end-cmd "\n")))
-    (ob-tmux--send-keys ob-session full-body)))
+(defun ob-tmux--ssh-script-silent (session window body)
+  "Generate a self-contained shell script for SSH fire-and-forget execution.
+SESSION and WINDOW: tmux target names.
+BODY: the code to send, embedded as a heredoc."
+  (let ((heredoc-marker "OB_TMUX_BODY_EOF"))
+    (concat
+     (format "SESSION=%s\nWINDOW=%s\n"
+	     (shell-quote-argument session)
+	     (shell-quote-argument window))
+     "TARGET=\"$SESSION:=$WINDOW\"\n"
+     "tmux has-session -t \"$SESSION\" 2>/dev/null || \\\n"
+     "  tmux new-session -d -c ~ -s \"$SESSION\" -n \"$WINDOW\"\n"
+     "if ! tmux list-windows -t \"$SESSION\" -F '#W' | grep -qx \"$WINDOW\"; then\n"
+     "  tmux new-window -c ~ -n \"$WINDOW\" -t \"$SESSION\"\nfi\n"
+     "tmux set-window-option -t \"$TARGET\" allow-rename off 2>/dev/null\n"
+     "tmux set-window-option -t \"$TARGET\" automatic-rename off 2>/dev/null\n"
+     (format "while IFS= read -r line || [ -n \"$line\" ]; do\n  tmux send-keys -l -t \"$TARGET\" -- \"$line\"\n  tmux send-keys -t \"$TARGET\" Enter\ndone <<'%s'\n" heredoc-marker)
+     body "\n"
+     heredoc-marker "\n")))
 
-(defun ob-tmux--extract-output (pane-text uuid)
-  "Extract command output from PANE-TEXT between markers identified by UUID.
-Returns the text between the marker lines, excluding the markers themselves,
-shell prompts, and the echo commands used for markers."
-  (let* ((start-re (concat "^OB_TMUX_START_" (regexp-quote uuid) "$"))
-	 (end-re (concat "^OB_TMUX_END_" (regexp-quote uuid) "$"))
-	 (prompt-re "^[^$\n]*\\$ ")
-	 (lines (split-string pane-text "\n"))
-	 (collecting nil)
-	 (result nil))
-    (dolist (line lines)
-      (cond
-       ((string-match-p end-re line)
-	(setq collecting nil))
-       (collecting
-	(unless (string-match-p prompt-re line)
-	  (push line result)))
-       ((string-match-p start-re line)
-	(setq collecting t))))
-    (let ((output (string-join (nreverse result) "\n")))
-      (string-trim-right output))))
+(defun ob-tmux--ssh-execute-async (ob-session script &optional callback)
+  "Execute SCRIPT on remote host via SSH asynchronously.
+OB-SESSION must have :ssh set.
+SCRIPT: complete shell script string to pipe to bash -s.
+CALLBACK: optional function called with (output exit-code) when done."
+  (let* ((ssh-host (ob-tmux--ssh ob-session))
+	 (process-name (format "ob-tmux-ssh-%s" (ob-tmux--session ob-session)))
+	 (buf (generate-new-buffer (format " *%s*" process-name)))
+	 (proc (start-process process-name buf "ssh" ssh-host "bash" "-s")))
+    (set-process-coding-system proc 'utf-8 'utf-8)
+    (process-send-string proc script)
+    (process-send-eof proc)
+    (when callback
+      (set-process-sentinel
+       proc
+       (lambda (process _event)
+	 (when (memq (process-status process) '(exit signal))
+	   (let ((output (with-current-buffer (process-buffer process)
+			   (buffer-string)))
+		 (exit-code (process-exit-status process)))
+	     (funcall callback output exit-code)
+	     (kill-buffer (process-buffer process)))))))
+    proc))
 
-(defun ob-tmux--start-output-poll (ob-session uuid org-buffer src-block-pos)
-  "Start polling for output from OB-SESSION.
-Looks for end marker identified by UUID in the tmux pane.
-When found, extracts the output and replaces the UUID placeholder in ORG-BUFFER."
-  (let ((timer nil))
-    (setq timer
-	  (run-with-timer
-	   org-babel-tmux-poll-interval
-	   org-babel-tmux-poll-interval
-	   (lambda ()
-	     (condition-case err
-		 (let* ((pane-text (ob-tmux--capture-pane ob-session))
-			(end-marker (concat "OB_TMUX_END_" uuid))
-			(found (seq-find
-				(lambda (l) (string-equal l end-marker))
-				(split-string pane-text "\n"))))
-		   (when found
-		     (cancel-timer timer)
-		     (let ((output (ob-tmux--extract-output pane-text uuid)))
-		       (when (buffer-live-p org-buffer)
-			 (with-current-buffer org-buffer
-			   (save-excursion
-			     (goto-char src-block-pos)
-			     (end-of-line)
-			     (org-babel-insert-result
-			      output '("output" "replace")))))
-		       (message "ob-tmux: output captured."))))
-	       (error
-		(cancel-timer timer)
-		(message "ob-tmux poll error: %S" err))))))))
+(defun ob-tmux--ssh-dispatch (ob-session body result-params)
+  "Dispatch fully non-blocking SSH execution for OB-SESSION with BODY.
+RESULT-PARAMS determines whether output is captured."
+  (let* ((session-name (ob-tmux--session ob-session))
+	 (window-name (ob-tmux--window-default ob-session))
+	 (output-p (member "output" result-params)))
+    (if output-p
+	;; Output capture path
+	(let* ((uuid (org-id-uuid))
+	       (src-block-pos (org-babel-where-is-src-block-head))
+	       (org-buffer (current-buffer))
+	       (script (ob-tmux--ssh-script-output
+			session-name window-name uuid
+			org-babel-tmux-ssh-timeout body)))
+	  ;; Insert UUID placeholder immediately (non-blocking)
+	  (save-excursion
+	    (goto-char src-block-pos)
+	    (end-of-line)
+	    (org-babel-insert-result uuid '("output" "replace")))
+	  ;; Launch async SSH process
+	  (ob-tmux--ssh-execute-async
+	   ob-session script
+	   (lambda (output exit-code)
+	     (if (= exit-code 0)
+		 (when (buffer-live-p org-buffer)
+		   (with-current-buffer org-buffer
+		     (save-excursion
+		       (goto-char src-block-pos)
+		       (end-of-line)
+		       (org-babel-insert-result
+			(string-trim-right output)
+			'("output" "replace")))))
+	       (message "ob-tmux SSH error (exit %d): %s" exit-code output))))
+	  nil)
+      ;; Silent path (fire-and-forget)
+      (let ((script (ob-tmux--ssh-script-silent
+		     session-name window-name body)))
+	(ob-tmux--ssh-execute-async
+	 ob-session script
+	 (lambda (_output exit-code)
+	   (unless (= exit-code 0)
+	     (message "ob-tmux SSH error (exit %d)" exit-code))))
+	(message "ob-tmux: code sent to %s via SSH." session-name)
+	nil))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Warnings
